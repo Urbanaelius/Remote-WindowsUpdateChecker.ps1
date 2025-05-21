@@ -8,7 +8,7 @@ $maxThreads = 5
 $computers = Get-Content -Path $deviceListPath | Where-Object { $_ -and $_.Trim() -ne "" }
 
 # Prepare result collection
-$results = [System.Collections.Concurrent.ConcurrentBag[Object]]::new()
+$results = @()
 
 # Create runspace pool
 $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
@@ -144,7 +144,9 @@ foreach ($computer in $computers) {
 foreach ($job in $jobs) {
     try {
         $output = $job.Pipe.EndInvoke($job.Async)
-        $results.Add($output)
+            foreach ($entry in $output) {
+            $results += $entry
+            }
     } catch {
         $results.Add([PSCustomObject]@{
             ComputerName = $job.Computer
@@ -155,7 +157,6 @@ foreach ($job in $jobs) {
 }
 
 # Save results to CSV
-$resultsArray = $results.ToArray()
-$resultsArray | Sort-Object ComputerName | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+$results | Sort-Object ComputerName | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
 Write-Host "✅ Report saved to: $outputCsv"
 
