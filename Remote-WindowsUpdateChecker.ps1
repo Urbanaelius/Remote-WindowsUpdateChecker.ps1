@@ -155,5 +155,7 @@ foreach ($job in $jobs) {
 }
 
 # Save results to CSV
-$results | Sort-Object ComputerName | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+$resultsArray = $results.ToArray()
+$resultsArray | Sort-Object ComputerName | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
 Write-Host "✅ Report saved to: $outputCsv"
+
