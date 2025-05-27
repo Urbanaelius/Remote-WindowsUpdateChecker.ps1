@@ -1,0 +1,54 @@
+PowerShell script: WSUS + Update Audit for remote computers
+
+#----------------------- CONFIGURATION -----------------------# $deviceListPath = "devicelist.txt"           # List of hostnames $kbListPath     = "kb_list.txt"              # List of KB numbers (one per line) $timestamp      = Get-Date -Format "yyyy-MM-dd_HH-mm" $outputHtml     = "UpdateReport_$timestamp.html" $outputCsv      = "UpdateReport_$timestamp.csv" $unreachableLog = "UnreachableDevices_$timestamp.txt" $maxThreads     = 5
+
+#----------------------- INITIALIZE --------------------------# $computers = Get-Content -Path $deviceListPath | Where-Object { $.Trim() -ne "" } $kbIDs     = Get-Content -Path $kbListPath | Where-Object { $.Trim() -ne "" } $results   = @() $unreachable = @()
+
+Create runspace pool
+
+$sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault() $runspacePool = [runspacefactory]::CreateRunspacePool(1, $maxThreads) $runspacePool.Open()
+
+Diagnostic script for each remote computer
+
+$scriptBlock = { param($computer, $kbIDs)
+
+$result = [PSCustomObject]@{
+    ComputerName     = $computer
+    Reachable        = $true
+    MissingKBs       = @()
+    ServicesStatus   = ""
+    FreeSpaceGB      = 0
+    LowDiskWarning   = "No"
+    PendingReboot    = "No"
+    SCCMCacheGB      = 0
+    Last3Hotfixes    = ""
+    WSUSServer       = ""
+    WSUSStatus       = ""
+    UpdateLogEntry   = ""
+    Error            = ""
+}
+
+try {
+    if (-not (Test-Connection -ComputerName $computer -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+        $result.Reachable = $false
+        return $result
+    }
+
+    Invoke-Command -ComputerName $computer -ScriptBlock {
+        param($kbIDs)
+        
+        $data = [PSCustomObject]@{
+            MissingKBs     = @()
+            ServicesStatus = ""
+            FreeSpaceGB    = 0
+            LowDiskWarning = "No"
+            PendingReboot  = "No"
+            SCCMCacheGB    = 0
+            Last3Hotfixes  = ""
+            WSUSServer     = ""
+            WSUSStatus     = ""
+            UpdateLogEntry = ""
+        }
+
+        foreach ($kb in $kb
+
