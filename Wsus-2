@@ -1,0 +1,207 @@
+PowerShell script: WSUS + Update Audit for remote computers
+
+#----------------------- CONFIGURATION -----------------------# $deviceListPath = "devicelist.txt"           # List of hostnames $kbListPath     = "kb_list.txt"              # List of KB numbers (one per line) $timestamp      = Get-Date -Format "yyyy-MM-dd_HH-mm" $outputHtml     = "UpdateReport_$timestamp.html" $outputCsv      = "UpdateReport_$timestamp.csv" $unreachableLog = "UnreachableDevices_$timestamp.txt" $maxThreads     = 5
+
+#----------------------- INITIALIZE --------------------------# $computers = Get-Content -Path $deviceListPath | Where-Object { $.Trim() -ne "" } $kbIDs     = Get-Content -Path $kbListPath | Where-Object { $.Trim() -ne "" } $results   = @() $unreachable = @()
+
+Create runspace pool
+
+$sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault() $runspacePool = [runspacefactory]::CreateRunspacePool(1, $maxThreads) $runspacePool.Open()
+
+Diagnostic script for each remote computer
+
+$scriptBlock = { param($computer, $kbIDs)
+
+$result = [PSCustomObject]@{
+    ComputerName     = $computer
+    Reachable        = $true
+    MissingKBs       = @()
+    ServicesStatus   = ""
+    FreeSpaceGB      = 0
+    LowDiskWarning   = "No"
+    PendingReboot    = "No"
+    SCCMCacheGB      = 0
+    Last3Hotfixes    = ""
+    WSUSServer       = ""
+    WSUSPingResult   = ""
+    WSUSStatus       = ""
+    UpdateLogEntry   = ""
+    Error            = ""
+}
+
+try {
+    if (-not (Test-Connection -ComputerName $computer -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+        $result.Reachable = $false
+        return $result
+    }
+
+    Invoke-Command -ComputerName $computer -ScriptBlock {
+        param($kbIDs)
+        $data = [PSCustomObject]@{
+            MissingKBs     = @()
+            ServicesStatus = ""
+            FreeSpaceGB    = 0
+            LowDiskWarning = "No"
+            PendingReboot  = "No"
+            SCCMCacheGB    = 0
+            Last3Hotfixes  = ""
+            WSUSServer     = ""
+            WSUSPingResult = ""
+            WSUSStatus     = ""
+            UpdateLogEntry = ""
+        }
+
+        foreach ($kb in $kbIDs) {
+            if (-not (Get-HotFix -Id $kb -ErrorAction SilentlyContinue)) {
+                $data.MissingKBs += $kb
+            }
+        }
+
+        $services = @("ccmexec", "trustedinstaller", "bits")
+        $status = foreach ($svc in $services) {
+            try {
+                $s = Get-Service -Name $svc -ErrorAction Stop
+                "$svc:$($s.Status)"
+            } catch {
+                "$svc:NotFound"
+            }
+        }
+        $data.ServicesStatus = $status -join ", "
+
+        $drive = Get-PSDrive C
+        $freeGB = [math]::Round($drive.Free / 1GB, 2)
+        $data.FreeSpaceGB = $freeGB
+        if ($freeGB -lt 5) { $data.LowDiskWarning = "Yes" }
+
+        $rebootKeys = @(
+            "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending",
+            "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired",
+            "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\PendingFileRenameOperations"
+        )
+        foreach ($key in $rebootKeys) {
+            if (Test-Path $key) {
+                $data.PendingReboot = "Yes"
+                break
+            }
+        }
+
+        $cachePath = "$env:windir\\ccmcache"
+        if (Test-Path $cachePath) {
+            $size = (Get-ChildItem -Recurse -Force -Path $cachePath -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            $data.SCCMCacheGB = [math]::Round($size / 1GB, 2)
+        }
+
+        $hotfixes = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 3 -ExpandProperty HotFixID
+        $data.Last3Hotfixes = ($hotfixes -join ", ")
+
+        $reg = "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate"
+        if (Test-Path $reg) {
+            $wsus = (Get-ItemProperty -Path $reg).WUServer
+            $data.WSUSServer = $wsus
+            $data.WSUSPingResult = if (Test-Connection -ComputerName $wsus -Count 1 -Quiet) { "Success" } else { "Failed" }
+        }
+
+        $data.WSUSStatus = (Get-WmiObject -Namespace "root\\ccm" -Class SMS_Client -ErrorAction SilentlyContinue).WSUSLocation
+
+        $logPath = "C:\\Windows\\CCM\\Logs\\WUAHandler.log"
+        if (Test-Path $logPath) {
+            $lines = Get-Content $logPath -Tail 100 | Select-String -Pattern "($($kbIDs -join '|'))|fail|error" -SimpleMatch
+            $data.UpdateLogEntry = ($lines | Select-Object -First 1).ToString()
+        }
+
+        return $data
+
+    } -ArgumentList $kbIDs -ErrorAction Stop | ForEach-Object {
+        $result.MissingKBs     = $_.MissingKBs -join ", "
+        $result.ServicesStatus = $_.ServicesStatus
+        $result.FreeSpaceGB    = $_.FreeSpaceGB
+        $result.LowDiskWarning = $_.LowDiskWarning
+        $result.PendingReboot  = $_.PendingReboot
+        $result.SCCMCacheGB    = $_.SCCMCacheGB
+        $result.Last3Hotfixes  = $_.Last3Hotfixes
+        $result.WSUSServer     = $_.WSUSServer
+        $result.WSUSPingResult = $_.WSUSPingResult
+        $result.WSUSStatus     = $_.WSUSStatus
+        $result.UpdateLogEntry = $_.UpdateLogEntry
+    }
+
+} catch {
+    $result.Error = $_.Exception.Message
+}
+
+return $result
+
+}
+
+Launch jobs in runspaces
+
+$jobs = foreach ($computer in $computers) { $ps = [powershell]::Create() $ps.RunspacePool = $runspacePool $null = $ps.AddScript($scriptBlock).AddArgument($computer).AddArgument($kbIDs) [PSCustomObject]@{ Pipe     = $ps Async    = $ps.BeginInvoke() Computer = $computer } }
+
+Collect results
+
+foreach ($job in $jobs) { try { $output = $job.Pipe.EndInvoke($job.Async) foreach ($item in $output) { if ($item.Reachable -eq $true) { $results += $item } else { $unreachable += $item.ComputerName } } } catch { $unreachable += $job.Computer } $job.Pipe.Dispose() }
+
+Write unreachable to text file
+
+$unreachable | Set-Content -Path $unreachableLog -Encoding UTF8
+
+Save CSV
+
+$results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+Build HTML output
+
+$htmlHeader = @"
+
+<style>
+table { font-family: Arial; border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ddd; padding: 8px; }
+th { background-color: #f2f2f2; }
+tr:nth-child(even) { background-color: #f9f9f9; }
+tr:hover { background-color: #e0e0e0; }
+.success { background-color: #d4edda; }
+.warning { background-color: #fff3cd; }
+.error   { background-color: #f8d7da; }
+</style><h2>Windows Update Audit Report - $timestamp</h2>
+"@$htmlRows = foreach ($r in $results | Sort-Object ComputerName) { $class = "success" if ($r.Error -ne "" -or $r.MissingKBs) { $class = "error" } elseif ($r.LowDiskWarning -eq "Yes" -or $r.PendingReboot -eq "Yes") { $class = "warning" }
+
+"<tr class='$class'>
+    <td>$($r.ComputerName)</td>
+    <td>$($r.MissingKBs)</td>
+    <td>$($r.ServicesStatus)</td>
+    <td>$($r.FreeSpaceGB)</td>
+    <td>$($r.LowDiskWarning)</td>
+    <td>$($r.PendingReboot)</td>
+    <td>$($r.SCCMCacheGB)</td>
+    <td>$($r.Last3Hotfixes)</td>
+    <td>$($r.WSUSServer)</td>
+    <td>$($r.WSUSPingResult)</td>
+    <td>$($r.WSUSStatus)</td>
+    <td>$($r.UpdateLogEntry)</td>
+    <td>$($r.Error)</td>
+ </tr>"
+
+}
+
+$htmlBody = @"
+
+<table>
+<tr>
+    <th>ComputerName</th>
+    <th>MissingKBs</th>
+    <th>ServicesStatus</th>
+    <th>FreeSpaceGB</th>
+    <th>LowDiskWarning</th>
+    <th>PendingReboot</th>
+    <th>SCCMCacheGB</th>
+    <th>Last3Hotfixes</th>
+    <th>WSUSServer</th>
+    <th>WSUSPingResult</th>
+    <th>WSUSStatus</th>
+    <th>UpdateLogEntry</th>
+    <th>Error</th>
+</tr>
+$htmlRows
+</table>
+"@Set-Content -Path $outputHtml -Value ($htmlHeader + $htmlBody) -Encoding UTF8 Write-Host "✅ Report generated: $outputCsv + $outputHtml" Write-Host "❌ Unreachable computers saved to: $unreachableLog"
+
