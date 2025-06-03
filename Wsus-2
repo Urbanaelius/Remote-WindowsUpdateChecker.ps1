@@ -13,20 +13,21 @@ Diagnostic script for each remote computer
 $scriptBlock = { param($computer, $kbIDs)
 
 $result = [PSCustomObject]@{
-    ComputerName     = $computer
-    Reachable        = $true
-    MissingKBs       = @()
-    ServicesStatus   = ""
-    FreeSpaceGB      = 0
-    LowDiskWarning   = "No"
-    PendingReboot    = "No"
-    SCCMCacheGB      = 0
-    Last3Hotfixes    = ""
-    WSUSServer       = ""
-    WSUSPingResult   = ""
-    WSUSStatus       = ""
-    UpdateLogEntry   = ""
-    Error            = ""
+    ComputerName        = $computer
+    Reachable           = $true
+    MissingKBs          = @()
+    ServicesStatus      = ""
+    FreeSpaceGB         = 0
+    LowDiskWarning      = "No"
+    PendingReboot       = "No"
+    SCCMCacheGB         = 0
+    Last3Hotfixes       = ""
+    WSUSServer          = ""
+    WSUSPingResult      = ""
+    WSUSStatus          = ""
+    UpdateLogEntry      = ""
+    AppUpdateNames      = ""
+    Error               = ""
 }
 
 try {
@@ -38,17 +39,18 @@ try {
     Invoke-Command -ComputerName $computer -ScriptBlock {
         param($kbIDs)
         $data = [PSCustomObject]@{
-            MissingKBs     = @()
-            ServicesStatus = ""
-            FreeSpaceGB    = 0
-            LowDiskWarning = "No"
-            PendingReboot  = "No"
-            SCCMCacheGB    = 0
-            Last3Hotfixes  = ""
-            WSUSServer     = ""
-            WSUSPingResult = ""
-            WSUSStatus     = ""
-            UpdateLogEntry = ""
+            MissingKBs       = @()
+            ServicesStatus   = ""
+            FreeSpaceGB      = 0
+            LowDiskWarning   = "No"
+            PendingReboot    = "No"
+            SCCMCacheGB      = 0
+            Last3Hotfixes    = ""
+            WSUSServer       = ""
+            WSUSPingResult   = ""
+            WSUSStatus       = ""
+            UpdateLogEntry   = ""
+            AppUpdateNames   = ""
         }
 
         foreach ($kb in $kbIDs) {
@@ -109,10 +111,17 @@ try {
             $data.UpdateLogEntry = ($lines | Select-Object -First 1).ToString()
         }
 
+        try {
+            $updates = Get-WmiObject -Namespace "root\\ccm\\ClientSDK" -Class CCM_SoftwareUpdate | Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue
+            $data.AppUpdateNames = ($updates -join "; ")
+        } catch {
+            $data.AppUpdateNames = "Unable to retrieve"
+        }
+
         return $data
 
     } -ArgumentList $kbIDs -ErrorAction Stop | ForEach-Object {
-        $result.MissingKBs     = $_.MissingKBs -join ", "
+        $result.MissingKBs      = $_.MissingKBs -join ", "
         $result.ServicesStatus = $_.ServicesStatus
         $result.FreeSpaceGB    = $_.FreeSpaceGB
         $result.LowDiskWarning = $_.LowDiskWarning
@@ -123,6 +132,7 @@ try {
         $result.WSUSPingResult = $_.WSUSPingResult
         $result.WSUSStatus     = $_.WSUSStatus
         $result.UpdateLogEntry = $_.UpdateLogEntry
+        $result.AppUpdateNames = $_.AppUpdateNames
     }
 
 } catch {
@@ -178,6 +188,7 @@ tr:hover { background-color: #e0e0e0; }
     <td>$($r.WSUSPingResult)</td>
     <td>$($r.WSUSStatus)</td>
     <td>$($r.UpdateLogEntry)</td>
+    <td>$($r.AppUpdateNames)</td>
     <td>$($r.Error)</td>
  </tr>"
 
@@ -199,6 +210,7 @@ $htmlBody = @"
     <th>WSUSPingResult</th>
     <th>WSUSStatus</th>
     <th>UpdateLogEntry</th>
+    <th>AppUpdateNames</th>
     <th>Error</th>
 </tr>
 $htmlRows
