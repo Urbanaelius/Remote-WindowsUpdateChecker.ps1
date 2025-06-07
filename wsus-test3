@@ -6,6 +6,7 @@ $kbListPath         = "kb_list.txt"                # List of KB numbers (one per
 $timestamp          = Get-Date -Format "yyyy-MM-dd_HH-mm"
 $outputHtml         = "UpdateReport_$timestamp.html"
 $outputCsv          = "UpdateReport_$timestamp.csv"
+$outputMissingKbsCsv= "DevicesMissingKBs_$timestamp.csv"
 $unreachableLog     = "UnreachableDevices_$timestamp.txt"
 $reachableLog       = "ReachableDevices_$timestamp.txt"
 $maxThreads         = 5
@@ -125,7 +126,15 @@ $scriptBlock = {
             if (Test-Path $reg) {
                 $wsus = (Get-ItemProperty -Path $reg).WUServer
                 $data.WSUSServer = $wsus
-                $data.WSUSPingResult = if (Test-Connection -ComputerName $wsus -Count 1 -Quiet) { "Success" } else { "Failed" }
+                try {
+                    $wsusUri = [System.Uri]$wsus
+                    $wsusServer = $wsusUri.Host
+                    $wsusPort = $wsusUri.Port
+                    $pingResult = Test-NetConnection -ComputerName $wsusServer -Port $wsusPort -WarningAction SilentlyContinue
+                    $data.WSUSPingResult = if ($pingResult.TcpTestSucceeded) { "Success" } else { "Failed" }
+                } catch {
+                    $data.WSUSPingResult = "Invalid WSUS URL or Test Failed"
+                }
             }
 
             $data.WSUSStatus = (Get-WmiObject -Namespace "root\\ccm" -Class SMS_Client -ErrorAction SilentlyContinue).WSUSLocation
@@ -199,10 +208,14 @@ foreach ($job in $jobs) {
 
 $results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
 
+# Export Devices Missing KBs Clearly
+$devicesMissingKBs = $results | Where-Object { $_.MissingKBs -ne "" }
+$devicesMissingKBs | Export-Csv -Path $outputMissingKbsCsv -NoTypeInformation -Encoding UTF8
+
 $results | ConvertTo-Html -Property ComputerName,MissingKBs,ServicesStatus,FreeSpaceGB,LowDiskWarning,PendingReboot,SCCMCacheGB,Last3Hotfixes,WSUSServer,WSUSPingResult,WSUSStatus,AppUpdateNames,SoftwareDistErrors,SCCMUpdateErrors,Error -Head "<style>body{font-family:sans-serif}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px;text-align:left}th{background:#eee}</style>" -Title "WSUS Update Audit Report" | Out-File $outputHtml
 
 Start-Process $outputHtml
 
-Write-Host "✅ Reports generated: $outputCsv, $outputHtml"
+Write-Host "✅ Reports generated: $outputCsv, $outputHtml, $outputMissingKbsCsv"
 Write-Host "✅ Reachable: $reachableLog"
 Write-Host "❌ Unreachable: $unreachableLog"
