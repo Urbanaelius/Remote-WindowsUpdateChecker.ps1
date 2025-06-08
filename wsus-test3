@@ -9,7 +9,10 @@ $outputCsv          = "UpdateReport_$timestamp.csv"
 $errorLogFile       = "UpdateErrors_$timestamp.txt"
 $unreachableLog     = "UnreachableDevices_$timestamp.txt"
 $reachableLog       = "ReachableDevices_$timestamp.txt"
+$errorDetailsFile   = "ErrorDetails_$timestamp.csv"
 $maxThreads         = 5
+
+$scriptStartTime = Get-Date
 
 #----------------------- INITIALIZE --------------------------#
 $allComputers = Get-Content -Path $deviceListPath | Where-Object { $_.Trim() -ne "" }
@@ -20,8 +23,10 @@ $unreachable  = @()
 Write-Host "🔍 Testing device reachability..."
 foreach ($computer in $allComputers) {
     if (Test-Connection -ComputerName $computer -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+        Write-Host "[✓] Reachable: $computer" -ForegroundColor Green
         $reachable += $computer
     } else {
+        Write-Host "[X] Unreachable: $computer" -ForegroundColor Red
         $unreachable += $computer
     }
 }
@@ -29,8 +34,12 @@ foreach ($computer in $allComputers) {
 $reachable | Set-Content -Path $reachableLog -Encoding UTF8
 $unreachable | Set-Content -Path $unreachableLog -Encoding UTF8
 
+Write-Host "Total Reachable Devices: $($reachable.Count)"
+Write-Host "Total Unreachable Devices: $($unreachable.Count)"
+
 #-------------------- RUNSPACE EXECUTION ---------------------#
 $results = @()
+$errorDetails = @()
 $errors  = @()
 
 $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
@@ -54,9 +63,13 @@ $scriptBlock = {
         WSUSStatus           = ""
         UpdateLogEntry       = ""
         AppUpdateNames       = ""
+        AvailableUpdates     = ""
+    }
+
+    $errorResult = [PSCustomObject]@{
+        ComputerName         = $computer
         SoftwareDistErrors   = ""
         SCCMUpdateErrors     = ""
-        AvailableUpdates     = ""
     }
 
     try {
@@ -75,8 +88,8 @@ $scriptBlock = {
                 WSUSStatus         = ""
                 UpdateLogEntry     = ""
                 AppUpdateNames     = ""
-                SoftwareDistErrors = ""
-                SCCMUpdateErrors   = ""
+                SoftwareDistErrors = @()
+                SCCMUpdateErrors   = @()
                 AvailableUpdates   = ""
             }
 
@@ -154,24 +167,22 @@ $scriptBlock = {
 
             $distLog = "C:\\Windows\\SoftwareDistribution\\ReportingEvents.log"
             if (Test-Path $distLog) {
-                $errorLines = @()
                 foreach ($kb in $kbIDs) {
                     $match = Get-Content $distLog -ErrorAction SilentlyContinue | Where-Object { $_ -match $kb -and $_ -match "failure" }
-                    if ($match) { $errorLines += $match }
+                    if ($match) { $data.SoftwareDistErrors += $match }
                 }
-                $data.SoftwareDistErrors = ($errorLines -join "`n")
             }
 
             $wualog = "C:\\Windows\\CCM\\Logs\\WUAHandler.log"
             if (Test-Path $wualog) {
                 $sccmErrors = Get-Content $wualog -Tail 100 | Where-Object { $_ -match "fail|error" }
-                $data.SCCMUpdateErrors = ($sccmErrors -join "`n")
+                $data.SCCMUpdateErrors += $sccmErrors
             }
 
             return $data
 
         } -ArgumentList $kbIDs -ErrorAction Stop | ForEach-Object {
-            $result.MissingKBs         = ($_.MissingKBs -join "`n")
+            $result.MissingKBs         = $_.MissingKBs -join "`n"
             $result.ServicesStatus     = $_.ServicesStatus
             $result.FreeSpaceGB        = $_.FreeSpaceGB
             $result.LowDiskWarning     = $_.LowDiskWarning
@@ -182,19 +193,24 @@ $scriptBlock = {
             $result.WSUSPingResult     = $_.WSUSPingResult
             $result.WSUSStatus         = $_.WSUSStatus
             $result.AppUpdateNames     = $_.AppUpdateNames
-            $result.SoftwareDistErrors = $_.SoftwareDistErrors
-            $result.SCCMUpdateErrors   = $_.SCCMUpdateErrors
             $result.AvailableUpdates   = $_.AvailableUpdates
+
+            $errorResult.SoftwareDistErrors = $_.SoftwareDistErrors -join "`n"
+            $errorResult.SCCMUpdateErrors   = $_.SCCMUpdateErrors -join "`n"
         }
 
     } catch {
         $errors += "[$computer] $_"
     }
 
-    return $result
+    return [PSCustomObject]@{
+        Result = $result
+        Errors = $errorResult
+    }
 }
 
 $jobs = foreach ($computer in $reachable) {
+    Write-Host "⏳ Auditing $computer..."
     $ps = [powershell]::Create()
     $ps.RunspacePool = $runspacePool
     $null = $ps.AddScript($scriptBlock).AddArgument($computer).AddArgument($kbIDs)
@@ -208,24 +224,36 @@ $jobs = foreach ($computer in $reachable) {
 foreach ($job in $jobs) {
     try {
         $output = $job.Pipe.EndInvoke($job.Async)
-        foreach ($item in $output) { $results += $item }
-    } catch {}
+        $results += $output.Result
+        $errorDetails += $output.Errors
+        Write-Host "[✓] Completed: $($job.Computer)" -ForegroundColor Green
+    } catch {
+        $errors += "[$($job.Computer)] $($_.Exception.Message)"
+        Write-Host "[X] Failed: $($job.Computer)" -ForegroundColor Red
+    }
     $job.Pipe.Dispose()
 }
 
 $results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
 
-$results | ConvertTo-Html -Property ComputerName,MissingKBs,ServicesStatus,FreeSpaceGB,LowDiskWarning,PendingReboot,SCCMCacheGB,Last3Hotfixes,WSUSServer,WSUSPingResult,WSUSStatus,AppUpdateNames,AvailableUpdates,SoftwareDistErrors,SCCMUpdateErrors -Head "<style>body{font-family:sans-serif}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px;text-align:left}th{background:#eee}</style>" -Title "WSUS Update Audit Report" | Out-File $outputHtml
+$results | ConvertTo-Html -Property ComputerName,MissingKBs,ServicesStatus,FreeSpaceGB,LowDiskWarning,PendingReboot,SCCMCacheGB,Last3Hotfixes,WSUSServer,WSUSPingResult,WSUSStatus,AppUpdateNames,AvailableUpdates -Head "<style>body{font-family:sans-serif}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px;text-align:left}th{background:#eee}</style>" -Title "WSUS Update Audit Report" | Out-File $outputHtml
 
 if ($errors.Count -gt 0) {
     $errors | Out-File -FilePath $errorLogFile -Encoding UTF8
 }
 
-Start-Process $outputHtml
+if ($errorDetails.Count -gt 0) {
+    $errorDetails | Export-Csv -Path $errorDetailsFile -NoTypeInformation -Encoding UTF8
+}
 
+$elapsed = (Get-Date) - $scriptStartTime
+Write-Host "⏱️  Total Time Taken: $($elapsed.Hours)h $($elapsed.Minutes)m $($elapsed.Seconds)s"
 Write-Host "✅ Reports generated: $outputCsv, $outputHtml"
 Write-Host "✅ Reachable: $reachableLog"
 Write-Host "❌ Unreachable: $unreachableLog"
 if ($errors.Count -gt 0) {
     Write-Host "⚠️  Errors logged to: $errorLogFile"
+    Write-Host "⚠️  Error details exported to: $errorDetailsFile"
 }
+
+Start-Process $outputHtml
