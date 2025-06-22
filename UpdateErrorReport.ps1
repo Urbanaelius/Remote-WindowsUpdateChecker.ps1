@@ -1,12 +1,18 @@
 
-# Enhanced_Collect_WindowsUpdateErrors.ps1
-# Collects update error data, disk space, SCCM cache, WSUS connectivity, and generates CSV and HTML reports
+# Final_Collect_WindowsUpdateErrors.ps1
+# Enhanced and flexible script that collects Windows Update failure data, WSUS details, disk info, and more
 
 $computerListPath = "C:\Temp\failed_devices.txt"
-$kbID = "KB5055518"
-$wsusServer = "http://wsusserver:8530"
+$kbFilePath = "C:\Temp\KB.txt"
 $htmlReportPath = "C:\Temp\PatchFailureReport.html"
 $csvReportPath = "C:\Temp\PatchFailureAnalysis.csv"
+
+# Read the target KB from file
+if (-Not (Test-Path $kbFilePath)) {
+    Write-Error "KB.txt file not found at $kbFilePath"
+    exit
+}
+$kbID = Get-Content $kbFilePath | Select-Object -First 1
 
 $results = @()
 
@@ -18,8 +24,20 @@ foreach ($comp in $computers) {
     if (Test-Connection -ComputerName $comp -Count 1 -Quiet) {
         try {
             $data = Invoke-Command -ComputerName $comp -ScriptBlock {
+                param($kbID)
+
+                function Get-WSUSServerFromRegistry {
+                    try {
+                        $key = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+                        $server = Get-ItemProperty -Path $key -ErrorAction Stop | Select-Object -ExpandProperty WUServer
+                        return $server
+                    } catch {
+                        return "Not Configured"
+                    }
+                }
+
                 $reportingEvents = Get-Content "C:\Windows\SoftwareDistribution\ReportingEvents.log" -ErrorAction SilentlyContinue |
-                    Select-String -Pattern $using:kbID | Out-String
+                    Select-String -Pattern $kbID | Out-String
 
                 $ccmLogs = Get-Content "C:\Windows\CCM\Logs\UpdatesDeployment.log" -Tail 50 -ErrorAction SilentlyContinue | Out-String
 
@@ -34,22 +52,26 @@ foreach ($comp in $computers) {
                     "{0:N2}" -f ((Get-ChildItem $cachePath -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB)
                 } else { "N/A" }
 
-                $wsusTest = Test-NetConnection -ComputerName "wsusserver" -Port 8530 -WarningAction SilentlyContinue
+                $wsusServer = Get-WSUSServerFromRegistry
+                $wsusHost = ($wsusServer -replace "^https?://", "") -replace "/.*$", ""
+                $wsusTest = Test-NetConnection -ComputerName $wsusHost -Port 8530 -WarningAction SilentlyContinue
 
                 $pendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
 
                 return [PSCustomObject]@{
                     ComputerName = $env:COMPUTERNAME
+                    KBTargeted = $kbID
+                    WSUSServer = $wsusServer
+                    WSUS_Ping = $wsusTest.PingSucceeded
+                    WSUS_TCP_Connected = $wsusTest.TcpTestSucceeded
                     FreeSpace_GB = $freeSpaceGB
                     SCCMCache_MB = $cacheSizeMB
+                    PendingReboot = $pendingReboot
                     ReportingEvents = $reportingEvents.Trim()
                     UpdatesDeploymentLog = $ccmLogs.Trim()
                     WinUpdateErrors = $wuErrors.Trim()
-                    WSUS_Ping = $wsusTest.PingSucceeded
-                    WSUS_TCP_Connected = $wsusTest.TcpTestSucceeded
-                    PendingReboot = $pendingReboot
                 }
-            }
+            } -ArgumentList $kbID
 
             $results += $data
         } catch {
@@ -65,11 +87,11 @@ $results | Export-Csv -Path $csvReportPath -NoTypeInformation
 
 # Export to HTML
 $results |
-    Select-Object ComputerName, FreeSpace_GB, SCCMCache_MB, WSUS_Ping, WSUS_TCP_Connected, PendingReboot,
+    Select-Object ComputerName, KBTargeted, WSUSServer, WSUS_Ping, WSUS_TCP_Connected, FreeSpace_GB, SCCMCache_MB, PendingReboot,
         @{Name="ReportingEvents";Expression={($_.ReportingEvents -replace "`n", "<br>")}},
         @{Name="UpdatesDeploymentLog";Expression={($_.UpdatesDeploymentLog -replace "`n", "<br>")}},
         @{Name="WinUpdateErrors";Expression={($_.WinUpdateErrors -replace "`n", "<br>")}} |
-    ConvertTo-Html -Property ComputerName, FreeSpace_GB, SCCMCache_MB, WSUS_Ping, WSUS_TCP_Connected, PendingReboot,
+    ConvertTo-Html -Property ComputerName, KBTargeted, WSUSServer, WSUS_Ping, WSUS_TCP_Connected, FreeSpace_GB, SCCMCache_MB, PendingReboot,
         ReportingEvents, UpdatesDeploymentLog, WinUpdateErrors `
     -Head '<style>table {border-collapse: collapse; width: 100%; font-family: Segoe UI; font-size: 12px;} th, td {border: 1px solid #ccc; padding: 6px;} th {background-color: #f2f2f2;}</style>' `
     -Title "Patch Failure Report" |
