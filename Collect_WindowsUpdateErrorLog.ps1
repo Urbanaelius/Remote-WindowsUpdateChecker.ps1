@@ -14,7 +14,15 @@ $computers = Get-Content $computerListPath
 $jobs = @()
 $results = @()
 
-# Function inside script scope so Jobs can use it
+# Extract Error Codes from Log Text
+function Get-ErrorCodesFromText {
+    param ($logText)
+    if (-not $logText) { return "" }
+    $codes = Select-String -InputObject $logText -Pattern "0x[0-9A-Fa-f]{8}" -AllMatches | ForEach-Object { $_.Matches.Value }
+    return ($codes | Sort-Object -Unique) -join ", "
+}
+
+# Scriptblock for Remote Collection
 $scriptBlock = {
     param($comp, $kbID)
 
@@ -67,9 +75,18 @@ $scriptBlock = {
                 }
                 $pendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
                 $kbInstalled = (Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.HotFixID -eq $kbID }).HotFixID
-                $reportingEvents = Get-Content "C:\Windows\SoftwareDistribution\ReportingEvents.log" -ErrorAction SilentlyContinue | Select-String -Pattern $kbID | Out-String
-                $ccmLogs = Get-Content "C:\Windows\CCM\Logs\UpdatesDeployment.log" -Tail 50 -ErrorAction SilentlyContinue | Out-String
-                $wuErrors = Get-WinEvent -FilterHashtable @{LogName='System'; ID=20,25,31,34} -MaxEvents 10 -ErrorAction SilentlyContinue | Select TimeCreated, Id, Message | Out-String
+
+                $logs = @{
+                    ReportingEvents = ""
+                    UpdatesDeploymentLog = ""
+                    WinUpdateErrors = ""
+                }
+
+                if (-not $kbInstalled) {
+                    $logs.ReportingEvents = Get-Content "C:\Windows\SoftwareDistribution\ReportingEvents.log" -ErrorAction SilentlyContinue | Out-String
+                    $logs.UpdatesDeploymentLog = Get-Content "C:\Windows\CCM\Logs\UpdatesDeployment.log" -Tail 50 -ErrorAction SilentlyContinue | Out-String
+                    $logs.WinUpdateErrors = Get-WinEvent -FilterHashtable @{LogName='System'; ID=20,25,31,34} -MaxEvents 10 -ErrorAction SilentlyContinue | Select TimeCreated, Id, Message | Out-String
+                }
 
                 return [PSCustomObject]@{
                     FreeSpace_GB = $freeSpaceGB
@@ -78,9 +95,9 @@ $scriptBlock = {
                     WSUSPingResult = $wsusPingResult
                     PendingReboot = $pendingReboot
                     KBInstalled = if ($kbInstalled) { "Yes" } else { "No" }
-                    ReportingEvents = $reportingEvents.Trim()
-                    UpdatesDeploymentLog = $ccmLogs.Trim()
-                    WinUpdateErrors = $wuErrors.Trim()
+                    ReportingEvents = $logs.ReportingEvents.Trim()
+                    UpdatesDeploymentLog = $logs.UpdatesDeploymentLog.Trim()
+                    WinUpdateErrors = $logs.WinUpdateErrors.Trim()
                 }
             } -ArgumentList $kbID -ErrorAction Stop | ForEach-Object {
                 $data.FreeSpace_GB = $_.FreeSpace_GB
@@ -100,27 +117,34 @@ $scriptBlock = {
     return $data
 }
 
-# Launch Jobs with Thread Limit
+# Launch Jobs with Thread Control
 foreach ($comp in $computers) {
     while (@(Get-Job -State Running).Count -ge $maxThreads) { Start-Sleep -Seconds 2 }
 
-    $jobs += Start-Job -ScriptBlock $scriptBlock -ArgumentList $comp, $kbID
+    Start-Job -ScriptBlock $scriptBlock -ArgumentList $comp, $kbID | Out-Null
 }
 
-# Collect Results
-Write-Host "⏳ Waiting for jobs to complete..."
-Wait-Job -Job $jobs
+# Collect Results with Real-Time Status
+Write-Host "⏳ Collecting Data..."
+do {
+    $completedJobs = Get-Job -State Completed
+    foreach ($job in $completedJobs) {
+        $output = Receive-Job -Job $job
+        if ($output.Reachable -eq "Yes") {
+            Write-Host "✔️  $($output.ComputerName) is reachable" -ForegroundColor Green
+        } else {
+            Write-Host "❌ $($output.ComputerName) is unreachable" -ForegroundColor Red
+        }
+        $results += $output
+        Remove-Job -Job $job
+    }
+    Start-Sleep -Seconds 2
+} while ((Get-Job).Count -gt 0)
 
-foreach ($j in $jobs) {
-    $output = Receive-Job -Job $j
-    $results += $output
-    Remove-Job -Job $j
-}
-
-# Save to CSV
+# Export CSV with Full Logs
 $results | Export-Csv -Path $csvReportPath -NoTypeInformation
 
-# HTML with Color Coding and Expandable Logs
+# Build Clean HTML Report
 $htmlHeader = @'
 <style>
 table { border-collapse: collapse; width: 100%; font-family: Segoe UI; font-size: 12px; }
@@ -128,20 +152,18 @@ th, td { border: 1px solid #ccc; padding: 6px; vertical-align: top; }
 th { background-color: #f2f2f2; }
 .green { background-color: #d4edda; }
 .red { background-color: #f8d7da; }
-details { margin-top: 5px; }
-summary { font-weight: bold; cursor: pointer; }
 </style>
 '@
 
 $results | Select-Object ComputerName,
-    @{Name="Reachable"; Expression={ if ($_.Reachable -eq "Yes") { '<div class="green">✔️ Yes</div>' } else { '<div class="red">❌ No</div>' } }},
+    @{Name="Reachable"; Expression={ if ($_.Reachable -eq "Yes") { '<div class="green">Yes</div>' } else { '<div class="red">No</div>' } }},
     KBTargeted, KBInstalled, WSUSServer, WSUSPingResult, FreeSpace_GB, SCCMCache_GB, PendingReboot,
-    @{Name="ReportingEvents"; Expression={ "<details><summary>View</summary><pre>$($_.ReportingEvents)</pre></details>" }},
-    @{Name="UpdatesDeploymentLog"; Expression={ "<details><summary>View</summary><pre>$($_.UpdatesDeploymentLog)</pre></details>" }},
-    @{Name="WinUpdateErrors"; Expression={ "<details><summary>View</summary><pre>$($_.WinUpdateErrors)</pre></details>" }} |
+    @{Name="ReportingEvent_Errors"; Expression={ Get-ErrorCodesFromText $_.ReportingEvents }},
+    @{Name="UpdatesDeploymentLog_Errors"; Expression={ Get-ErrorCodesFromText $_.UpdatesDeploymentLog }},
+    @{Name="WinUpdateErrors_Errors"; Expression={ Get-ErrorCodesFromText $_.WinUpdateErrors }} |
     ConvertTo-Html -Property * -Head $htmlHeader -Title "Patch Failure Report" |
     Out-File $htmlReportPath
 
-Write-Host "✅ Reports generated:"
+Write-Host "`n✅ Reports generated:"
 Write-Host " - CSV: $csvReportPath"
 Write-Host " - HTML: $htmlReportPath"
