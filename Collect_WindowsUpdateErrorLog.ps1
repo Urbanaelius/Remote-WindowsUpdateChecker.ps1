@@ -1,8 +1,9 @@
 # Paths and Setup
 $computerListPath = "C:\Temp\failed_devices.txt"
 $kbFilePath = "C:\Temp\KB.txt"
-$htmlReportPath = "C:\Temp\PatchFailureReport.html"
-$csvReportPath = "C:\Temp\PatchFailureAnalysis.csv"
+$timestamp      = Get-Date -Format "yyyyMMdd_HHmm"
+$htmlReportPath = "C:\Temp\PatchFailureReport-$timestamp.html"
+$csvReportPath = "C:\Temp\PatchFailureAnalysis-$timestamp.csv"
 $maxThreads = 10
 
 # Read KB to Check
@@ -125,26 +126,24 @@ foreach ($comp in $computers) {
 }
 
 # Collect Results with Real-Time Status
+
 Write-Host "⏳ Collecting Data..."
 do {
-    $completedJobs = Get-Job -State Completed
-    foreach ($job in $completedJobs) {
-        $output = Receive-Job -Job $job
-        if ($output.Reachable -eq "Yes") {
-            Write-Host "✔️  $($output.ComputerName) is reachable" -ForegroundColor Green
-        } else {
-            Write-Host "❌ $($output.ComputerName) is unreachable" -ForegroundColor Red
-        }
-        $results += $output
-        Remove-Job -Job $job
-    }
-    Start-Sleep -Seconds 2
+ $completedJobs = Get-Job -State Completed
+	foreach ($job in $completedJobs) {
+		$output = Receive-Job -Job $job
+			if ($output.Reachable -eq "Yes") {Write-Host "$($output.ComputerName) is reachable" -ForegroundColor Green} 
+			else {Write-Host "$($output.ComputerName) is unreachable" -ForegroundColor Red}
+		$results += $output
+		Remove-Job -Job $job }
 } while ((Get-Job).Count -gt 0)
+
 
 # Export CSV with Full Logs
 $results | Export-Csv -Path $csvReportPath -NoTypeInformation
 
 # Build Clean HTML Report
+
 $htmlHeader = @'
 <style>
 table { border-collapse: collapse; width: 100%; font-family: Segoe UI; font-size: 12px; }
@@ -155,15 +154,61 @@ th { background-color: #f2f2f2; }
 </style>
 '@
 
-$results | Select-Object ComputerName,
-    @{Name="Reachable"; Expression={ if ($_.Reachable -eq "Yes") { '<div class="green">Yes</div>' } else { '<div class="red">No</div>' } }},
-    KBTargeted, KBInstalled, WSUSServer, WSUSPingResult, FreeSpace_GB, SCCMCache_GB, PendingReboot,
-    @{Name="ReportingEvent_Errors"; Expression={ Get-ErrorCodesFromText $_.ReportingEvents }},
-    @{Name="UpdatesDeploymentLog_Errors"; Expression={ Get-ErrorCodesFromText $_.UpdatesDeploymentLog }},
-    @{Name="WinUpdateErrors_Errors"; Expression={ Get-ErrorCodesFromText $_.WinUpdateErrors }} |
-    ConvertTo-Html -Property * -Head $htmlHeader -Title "Patch Failure Report" |
-    Out-File $htmlReportPath
+
+$htmlBody = foreach ($item in $results) {
+    $reachableHtml = if ($item.Reachable -eq "Yes") { '<div class="green">Yes</div>' } else { '<div class="red">No</div>' }
+    $kbInstalledHtml = if ($item.KBInstalled -eq "Yes") { '<div class="green">Yes</div>' } else { '<div class="red">No</div>' }
+    $reportingErrors = Get-ErrorCodesFromText $item.ReportingEvents
+    $deploymentErrors = Get-ErrorCodesFromText $item.UpdatesDeploymentLog
+    $winUpdateErrors = Get-ErrorCodesFromText $item.WinUpdateErrors
+
+    "<tr>
+        <td>$($item.ComputerName)</td>
+        <td>$reachableHtml</td>
+        <td>$($item.KBTargeted)</td>
+        <td>$kbInstalledHtml</td>
+        <td>$($item.WSUSServer)</td>
+        <td>$($item.WSUSPingResult)</td>
+        <td>$($item.FreeSpace_GB)</td>
+        <td>$($item.SCCMCache_GB)</td>
+        <td>$($item.PendingReboot)</td>
+        <td>$reportingErrors</td>
+        <td>$deploymentErrors</td>
+        <td>$winUpdateErrors</td>
+    </tr>"
+}
+
+$htmlTable = @"
+<html>
+<head>
+$htmlHeader
+</head>
+<body>
+<h2>Patch Failure Report</h2>
+<table>
+    <tr>
+        <th>ComputerName</th>
+        <th>Reachable</th>
+        <th>KBTargeted</th>
+        <th>KBInstalled</th>
+        <th>WSUSServer</th>
+        <th>WSUSPingResult</th>
+        <th>FreeSpace_GB</th>
+        <th>SCCMCache_GB</th>
+        <th>PendingReboot</th>
+        <th>ReportingEvent_Errors</th>
+        <th>UpdatesDeploymentLog_Errors</th>
+        <th>WinUpdateErrors_Errors</th>
+    </tr>
+    $($htmlBody -join "`n")
+</table>
+</body>
+</html>
+"@
+$htmlTable | Out-File $htmlReportPath -Encoding UTF8
 
 Write-Host "`n✅ Reports generated:"
 Write-Host " - CSV: $csvReportPath"
 Write-Host " - HTML: $htmlReportPath"
+
+Start-Process $htmlReportPath
