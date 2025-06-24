@@ -110,3 +110,5 @@ $results | Select-Object ComputerName, KBTargeted, KBInstalled, WSUSServer, WSUS
 Write-Host "✅ Reports generated:"
 Write-Host " - CSV: $csvReportPath"
 Write-Host " - HTML: $htmlReportPath"
+
+Start-Process $htmlReportPath
