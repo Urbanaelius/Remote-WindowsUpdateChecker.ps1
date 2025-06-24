@@ -1,25 +1,45 @@
-# Parallel Collection with Jobs
-
+# Paths and Setup
 $computerListPath = "C:\Temp\failed_devices.txt"
 $kbFilePath = "C:\Temp\KB.txt"
 $htmlReportPath = "C:\Temp\PatchFailureReport.html"
 $csvReportPath = "C:\Temp\PatchFailureAnalysis.csv"
-
-if (-Not (Test-Path $kbFilePath)) { Write-Error "KB.txt missing at $kbFilePath"; exit }
-$kbID = Get-Content $kbFilePath | Select-Object -First 1
-$computers = Get-Content $computerListPath
 $maxThreads = 10
 
+# Read KB to Check
+if (-Not (Test-Path $kbFilePath)) { Write-Error "KB.txt missing at $kbFilePath"; exit }
+$kbID = Get-Content $kbFilePath | Select-Object -First 1
+
+# Read Device List
+$computers = Get-Content $computerListPath
 $jobs = @()
 $results = @()
 
-function Collect-DeviceData {
+# Function inside script scope so Jobs can use it
+$scriptBlock = {
     param($comp, $kbID)
 
+    $data = [PSCustomObject]@{
+        ComputerName = $comp
+        Reachable = "No"
+        KBTargeted = $kbID
+        KBInstalled = "Unknown"
+        WSUSServer = "N/A"
+        WSUSPingResult = "N/A"
+        FreeSpace_GB = "N/A"
+        SCCMCache_GB = "N/A"
+        PendingReboot = "N/A"
+        ReportingEvents = ""
+        UpdatesDeploymentLog = ""
+        WinUpdateErrors = ""
+    }
+
     if (Test-Connection -ComputerName $comp -Count 1 -Quiet) {
+        $data.Reachable = "Yes"
+
         try {
             Invoke-Command -ComputerName $comp -ScriptBlock {
                 param($kbID)
+
                 function Get-WSUSServerFromRegistry {
                     try {
                         $key = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
@@ -52,63 +72,76 @@ function Collect-DeviceData {
                 $wuErrors = Get-WinEvent -FilterHashtable @{LogName='System'; ID=20,25,31,34} -MaxEvents 10 -ErrorAction SilentlyContinue | Select TimeCreated, Id, Message | Out-String
 
                 return [PSCustomObject]@{
-                    ComputerName = $env:COMPUTERNAME
-                    KBTargeted = $kbID
-                    KBInstalled = if ($kbInstalled) { "Yes" } else { "No" }
-                    WSUSServer = $wsus
-                    WSUSPingResult = $wsusPingResult
                     FreeSpace_GB = $freeSpaceGB
                     SCCMCache_GB = $cacheSizeGB
+                    WSUSServer = $wsus
+                    WSUSPingResult = $wsusPingResult
                     PendingReboot = $pendingReboot
+                    KBInstalled = if ($kbInstalled) { "Yes" } else { "No" }
                     ReportingEvents = $reportingEvents.Trim()
                     UpdatesDeploymentLog = $ccmLogs.Trim()
                     WinUpdateErrors = $wuErrors.Trim()
                 }
-            } -ArgumentList $kbID
-        } catch { Write-Warning "Error on $comp: $_" }
+            } -ArgumentList $kbID -ErrorAction Stop | ForEach-Object {
+                $data.FreeSpace_GB = $_.FreeSpace_GB
+                $data.SCCMCache_GB = $_.SCCMCache_GB
+                $data.WSUSServer = $_.WSUSServer
+                $data.WSUSPingResult = $_.WSUSPingResult
+                $data.PendingReboot = $_.PendingReboot
+                $data.KBInstalled = $_.KBInstalled
+                $data.ReportingEvents = $_.ReportingEvents
+                $data.UpdatesDeploymentLog = $_.UpdatesDeploymentLog
+                $data.WinUpdateErrors = $_.WinUpdateErrors
+            }
+        } catch {
+            $data.ReportingEvents = "Failed to connect or collect remote data"
+        }
     }
+    return $data
 }
 
+# Launch Jobs with Thread Limit
 foreach ($comp in $computers) {
     while (@(Get-Job -State Running).Count -ge $maxThreads) { Start-Sleep -Seconds 2 }
 
-    $jobs += Start-Job -ScriptBlock {
-        param($c, $k)
-        Collect-DeviceData -comp $c -kbID $k
-    } -ArgumentList $comp, $kbID
+    $jobs += Start-Job -ScriptBlock $scriptBlock -ArgumentList $comp, $kbID
 }
 
-# Wait for all jobs
+# Collect Results
 Write-Host "⏳ Waiting for jobs to complete..."
 Wait-Job -Job $jobs
-$results = $jobs | ForEach-Object {
-    Receive-Job -Job $_
-    Remove-Job -Job $_
+
+foreach ($j in $jobs) {
+    $output = Receive-Job -Job $j
+    $results += $output
+    Remove-Job -Job $j
 }
 
-# Export results
+# Save to CSV
 $results | Export-Csv -Path $csvReportPath -NoTypeInformation
 
-# Build HTML with expandable sections
+# HTML with Color Coding and Expandable Logs
 $htmlHeader = @'
 <style>
 table { border-collapse: collapse; width: 100%; font-family: Segoe UI; font-size: 12px; }
 th, td { border: 1px solid #ccc; padding: 6px; vertical-align: top; }
 th { background-color: #f2f2f2; }
+.green { background-color: #d4edda; }
+.red { background-color: #f8d7da; }
 details { margin-top: 5px; }
 summary { font-weight: bold; cursor: pointer; }
 </style>
 '@
 
-$results | Select-Object ComputerName, KBTargeted, KBInstalled, WSUSServer, WSUSPingResult, FreeSpace_GB, SCCMCache_GB, PendingReboot,
-    @{Name="ReportingEvents";Expression={ "<details><summary>View</summary><pre>$($_.ReportingEvents)</pre></details>" }},
-    @{Name="UpdatesDeploymentLog";Expression={ "<details><summary>View</summary><pre>$($_.UpdatesDeploymentLog)</pre></details>" }},
-    @{Name="WinUpdateErrors";Expression={ "<details><summary>View</summary><pre>$($_.WinUpdateErrors)</pre></details>" }} |
+$results | Select-Object ComputerName,
+    @{Name="Reachable"; Expression={ if ($_.Reachable -eq "Yes") { '<div class="green">✔️ Yes</div>' } else { '<div class="red">❌ No</div>' } }},
+    KBTargeted, KBInstalled, WSUSServer, WSUSPingResult, FreeSpace_GB, SCCMCache_GB, PendingReboot,
+    @{Name="ReportingEvents"; Expression={ "<details><summary>View</summary><pre>$($_.ReportingEvents)</pre></details>" }},
+    @{Name="UpdatesDeploymentLog"; Expression={ "<details><summary>View</summary><pre>$($_.UpdatesDeploymentLog)</pre></details>" }},
+    @{Name="WinUpdateErrors"; Expression={ "<details><summary>View</summary><pre>$($_.WinUpdateErrors)</pre></details>" }} |
     ConvertTo-Html -Property * -Head $htmlHeader -Title "Patch Failure Report" |
     Out-File $htmlReportPath
 
 Write-Host "✅ Reports generated:"
 Write-Host " - CSV: $csvReportPath"
 Write-Host " - HTML: $htmlReportPath"
-
-Start-Process $htmlReportPath
