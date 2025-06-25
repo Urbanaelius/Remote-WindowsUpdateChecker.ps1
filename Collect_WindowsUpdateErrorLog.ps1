@@ -1,14 +1,19 @@
+param (
+	[Parameter(Mandatory = $true)]
+	[string]$KBID
+)
+#Parameters to make -KBID as a required parameter when running the script. 
+#Eg: .\Collect_ windowsUpdateErrorLog.ps1 -KBID KB5058379
+
 # Paths and Setup
-$computerListPath = "C:\Temp\failed_devices.txt"
-$kbFilePath = "C:\Temp\KB.txt"
+$computerListPath = "Failed_devices.txt"
+#$kbFilePath = "kb_list.txt"
 $timestamp      = Get-Date -Format "yyyyMMdd_HHmm"
-$htmlReportPath = "C:\Temp\PatchFailureReport-$timestamp.html"
-$csvReportPath = "C:\Temp\PatchFailureAnalysis-$timestamp.csv"
+$htmlReportPath = ".\results\PatchFailureReport-$timestamp.html"
+$csvReportPath = ".\results\PatchFailureAnalysis-$timestamp.csv"
 $maxThreads = 10
 
-# Read KB to Check
-if (-Not (Test-Path $kbFilePath)) { Write-Error "KB.txt missing at $kbFilePath"; exit }
-$kbID = Get-Content $kbFilePath | Select-Object -First 1
+
 
 # Read Device List
 $computers = Get-Content $computerListPath
@@ -40,6 +45,9 @@ $scriptBlock = {
         ReportingEvents = ""
         UpdatesDeploymentLog = ""
         WinUpdateErrors = ""
+		WindowsUpdateDNS = "N/A"
+		WindowsUpdatePort443 = "N/A"
+
     }
 
     if (Test-Connection -ComputerName $comp -Count 1 -Quiet) {
@@ -74,6 +82,22 @@ $scriptBlock = {
                         $wsusPingResult = if ($pingResult.TcpTestSucceeded) { "Success" } else { "Failed" }
                     } catch { $wsusPingResult = "Invalid WSUS URL or Test Failed" }
                 }
+				# DNS resolution and ping test to windowsupdate.microsoft.com or update.microsoft.com.
+				$winUpdateHost = "windowsupdate.microsoft.com"
+				$winUpdateConnectivity = "Unknown"
+				$winUpdatePortTest = "Unknown"
+				try {
+					$dnsResolved = [System.Net.Dns]::GetHostAddresses($winUpdateHost)
+					if ($dnsResolved) {
+						$winUpdateConnectivity = "Resolved"
+						$portTest = Test-NetConnection -ComputerName $winUpdateHost -Port 443 -WarningAction SilentlyContinue
+						$winUpdatePortTest = if ($portTest.TcpTestSucceeded) { "Success" } else { "Failed" }
+					}
+				} catch {
+					$winUpdateConnectivity = "Failed"
+					$winUpdatePortTest = "Failed"
+				}
+
                 $pendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
                 $kbInstalled = (Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.HotFixID -eq $kbID }).HotFixID
 
@@ -99,6 +123,9 @@ $scriptBlock = {
                     ReportingEvents = $logs.ReportingEvents.Trim()
                     UpdatesDeploymentLog = $logs.UpdatesDeploymentLog.Trim()
                     WinUpdateErrors = $logs.WinUpdateErrors.Trim()
+					WindowsUpdateDNS = $winUpdateConnectivity
+					WindowsUpdatePort443 = $winUpdatePortTest
+
                 }
             } -ArgumentList $kbID -ErrorAction Stop | ForEach-Object {
                 $data.FreeSpace_GB = $_.FreeSpace_GB
@@ -110,6 +137,9 @@ $scriptBlock = {
                 $data.ReportingEvents = $_.ReportingEvents
                 $data.UpdatesDeploymentLog = $_.UpdatesDeploymentLog
                 $data.WinUpdateErrors = $_.WinUpdateErrors
+				$data.WindowsUpdateDNS = $_.WindowsUpdateDNS
+				$data.WindowsUpdatePort443 = $_.WindowsUpdatePort443
+
             }
         } catch {
             $data.ReportingEvents = "Failed to connect or collect remote data"
@@ -158,9 +188,12 @@ th { background-color: #f2f2f2; }
 $htmlBody = foreach ($item in $results) {
     $reachableHtml = if ($item.Reachable -eq "Yes") { '<div class="green">Yes</div>' } else { '<div class="red">No</div>' }
     $kbInstalledHtml = if ($item.KBInstalled -eq "Yes") { '<div class="green">Yes</div>' } else { '<div class="red">No</div>' }
+	$winUpdateDNSHtml = if ($item.WindowsUpdateDNS -eq "Resolved") { '<div class="green">Resolved</div>' } else { '<div class="red">Failed</div>' }
+	$winUpdatePortHtml = if ($item.WindowsUpdatePort443 -eq "Success") { '<div class="green">Success</div>' } else { '<div class="red">Failed</div>' }
     $reportingErrors = Get-ErrorCodesFromText $item.ReportingEvents
     $deploymentErrors = Get-ErrorCodesFromText $item.UpdatesDeploymentLog
     $winUpdateErrors = Get-ErrorCodesFromText $item.WinUpdateErrors
+
 
     "<tr>
         <td>$($item.ComputerName)</td>
@@ -168,7 +201,9 @@ $htmlBody = foreach ($item in $results) {
         <td>$($item.KBTargeted)</td>
         <td>$kbInstalledHtml</td>
         <td>$($item.WSUSServer)</td>
-        <td>$($item.WSUSPingResult)</td>
+        <td>$($item.WSUSPingResult)</td>		
+		<td>$winUpdateDNSHtml</td>
+		<td>$winUpdatePortHtml</td>
         <td>$($item.FreeSpace_GB)</td>
         <td>$($item.SCCMCache_GB)</td>
         <td>$($item.PendingReboot)</td>
@@ -192,7 +227,9 @@ $htmlHeader
         <th>KBTargeted</th>
         <th>KBInstalled</th>
         <th>WSUSServer</th>
-        <th>WSUSPingResult</th>
+        <th>WSUSPingResult</th>		
+		<th>WinUpdate DNS</th>
+		<th>WinUpdate Port 443</th>
         <th>FreeSpace_GB</th>
         <th>SCCMCache_GB</th>
         <th>PendingReboot</th>
@@ -205,7 +242,9 @@ $htmlHeader
 </body>
 </html>
 "@
+
 $htmlTable | Out-File $htmlReportPath -Encoding UTF8
+
 
 Write-Host "`n✅ Reports generated:"
 Write-Host " - CSV: $csvReportPath"
