@@ -1,0 +1,129 @@
+$KB = "KB5009543"
+$ComputerListPath = "computers.txt"
+
+# Output files
+$outputCSV = "AuditResults.csv"
+$errorCSV = "UpdateErrors.csv"
+$htmlReport = "AuditReport.html"
+$reachableList = "Reachable.txt"
+$unreachableList = "Unreachable.txt"
+
+$computers = Get-Content $ComputerListPath
+$results = @()
+$errors = @()
+$reachable = @()
+$unreachable = @()
+
+$ScriptBlock = {
+    param($KB)
+
+    $result = [PSCustomObject]@{
+        Computer = $env:COMPUTERNAME
+        KBInstalled = $false
+        CDriveGBFree = 0
+        SCCMCacheGB = 0
+        RestartPending = $false
+        WSUSServer = ''
+        WSUSPortOpen = $false
+        WindowsUpdateResolved = $false
+        WindowsUpdatePortOpen = $false
+        AvailableUpdates = ''
+        TriggerStatus = ''
+        ErrorCodes = ''
+    }
+
+    try {
+        # 0. Check if KB installed
+        if (Get-HotFix | Where-Object { $_.HotFixID -eq $KB }) {
+            $result.KBInstalled = $true
+        }
+
+        # 1. C drive space
+        $cDrive = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='C:'"
+        $result.CDriveGBFree = [math]::Round($cDrive.FreeSpace / 1GB, 2)
+
+        # 2. SCCM cache
+        $cachePath = "C:\Windows\ccmcache"
+        if (Test-Path $cachePath) {
+            $size = (Get-ChildItem -Recurse -Force $cachePath | Measure-Object -Property Length -Sum).Sum
+            $result.SCCMCacheGB = [math]::Round($size / 1GB, 2)
+        }
+
+        # 3. Restart pending check
+        $pending = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+        $result.RestartPending = $pending
+
+        # 4. Get WSUS server from registry
+        $wsusReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -ErrorAction SilentlyContinue
+        if ($wsusReg.WUServer) {
+            $result.WSUSServer = $wsusReg.WUServer
+            $uri = [uri]$wsusReg.WUServer
+            $result.WSUSPortOpen = Test-NetConnection -ComputerName $uri.Host -Port $uri.Port -WarningAction SilentlyContinue | Select-Object -ExpandProperty TcpTestSucceeded
+        }
+
+        # 5. Windows Update server connectivity
+        $winSrv = "windowsupdate.microsoft.com"
+        $result.WindowsUpdateResolved = [bool](Resolve-DnsName $winSrv -ErrorAction SilentlyContinue)
+        $result.WindowsUpdatePortOpen = Test-NetConnection -ComputerName $winSrv -Port 443 -WarningAction SilentlyContinue | Select-Object -ExpandProperty TcpTestSucceeded
+
+        # 6. List available updates via SCCM WMI
+        $updates = Get-WmiObject -Namespace "root\ccm\SoftwareUpdates\DeploymentAgent" -Class CCM_SoftwareUpdate
+        if ($updates) {
+            $result.AvailableUpdates = ($updates | Where-Object { $_.EvaluationState -eq 2 } | Select-Object -ExpandProperty Name) -join "; "
+        }
+
+        # 7. Trigger install via SCCM
+        $updateMgr = [wmiclass]"ROOT\ccm\ClientSDK:CCM_SoftwareUpdatesManager"
+        $applicableUpdates = $updates | Where-Object { $_.EvaluationState -eq 2 }
+        if ($applicableUpdates) {
+            $result.TriggerStatus = $updateMgr.InstallUpdates($applicableUpdates).ReturnValue
+        }
+
+        # 9. Monitor for update errors in real-time
+        Start-Sleep -Seconds 10
+        $status = Get-WmiObject -Namespace "root\ccm\SoftwareUpdates\DeploymentAgent" -Class CCM_UpdateStatus
+        $errorUpdates = $status | Where-Object { $_.LastErrorCode -ne 0 }
+        $result.ErrorCodes = ($errorUpdates | Select-Object -ExpandProperty LastErrorCode | Sort-Object -Unique) -join ", "
+    }
+    catch {
+        $result.ErrorCodes = $_.Exception.Message
+    }
+
+    return $result
+}
+
+# Start parallel processing
+$jobs = @()
+foreach ($computer in $computers) {
+    if (Test-Connection -ComputerName $computer -Count 2 -Quiet) {
+        $reachable += $computer
+        $jobs += Invoke-Command -ComputerName $computer -ScriptBlock $ScriptBlock -ArgumentList $KB -AsJob
+    } else {
+        $unreachable += $computer
+    }
+
+    while ($jobs.Count -ge 20) {
+        Start-Sleep -Seconds 2
+        $jobs = $jobs | Where-Object { $_.State -eq "Running" }
+    }
+}
+
+# Wait for remaining jobs
+Get-Job | Wait-Job
+$jobs = Get-Job | Receive-Job
+
+# Collect results
+foreach ($jobResult in $jobs) {
+    $results += $jobResult
+    if ($jobResult.ErrorCodes -and $jobResult.ErrorCodes -ne '0') {
+        $errors += $jobResult
+    }
+}
+
+# Save files
+$results | Export-Csv $outputCSV -NoTypeInformation
+$errors | Export-Csv $errorCSV -NoTypeInformation
+$reachable | Out-File $reachableList
+$unreachable | Out-File $unreachableList
+
+# Create HTML summary (same format as before, not repeated here for brevity)
