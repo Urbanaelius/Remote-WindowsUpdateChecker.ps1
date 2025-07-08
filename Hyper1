@@ -1,0 +1,151 @@
+param(
+    [string]$KB,
+    [string]$ComputerListPath
+)
+
+# Output paths
+$outputCSV = "UpdateAuditResults.csv"
+$errorCSV = "UpdateErrors.csv"
+$htmlReport = "UpdateAuditReport.html"
+$reachableList = "ReachableComputers.txt"
+$unreachableList = "UnreachableComputers.txt"
+
+# Load computer list
+$computers = Get-Content $ComputerListPath
+
+# Results arrays
+$results = @()
+$errors = @()
+$reachable = @()
+$unreachable = @()
+
+# Max threads
+$ThrottleLimit = 20
+
+# Define ScriptBlock for remote tasks
+$scriptBlock = {
+    param($KB)
+    
+    $result = [PSCustomObject]@{
+        Computer = $env:COMPUTERNAME
+        KBInstalled = $false
+        CDriveGBFree = 0
+        SCCMCacheGB = 0
+        RestartPending = $false
+        WSUSResolved = $false
+        WSUSPortOpen = $false
+        WindowsUpdateResolved = $false
+        WindowsUpdatePortOpen = $false
+        AvailableUpdates = ''
+        TriggerStatus = ''
+        ErrorCodes = ''
+    }
+
+    try {
+        # 0. Check if KB installed
+        $kbInstalled = Get-HotFix | Where-Object {$_.HotFixID -eq $KB}
+        if ($kbInstalled) { $result.KBInstalled = $true }
+
+        # 1. Get C drive free space
+        $cDrive = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='C:'"
+        $result.CDriveGBFree = [math]::Round($cDrive.FreeSpace / 1GB, 2)
+
+        # 2. Get SCCM Cache size
+        $cachePath = "C:\Windows\ccmcache"
+        if (Test-Path $cachePath) {
+            $size = (Get-ChildItem -Recurse -Force $cachePath | Measure-Object -Property Length -Sum).Sum
+            $result.SCCMCacheGB = [math]::Round($size / 1GB, 2)
+        }
+
+        # 3. Check restart pending
+        $pending = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue)
+        if ($pending) { $result.RestartPending = $true }
+
+        # 4. Resolve WSUS and check port
+        $wsus = "yourwsusserver.domain.com"
+        $result.WSUSResolved = [bool](Resolve-DnsName $wsus -ErrorAction SilentlyContinue)
+        $result.WSUSPortOpen = Test-NetConnection -ComputerName $wsus -Port 8530 -WarningAction SilentlyContinue | Select-Object -ExpandProperty TcpTestSucceeded
+
+        # 5. Resolve Windows Update server and check port
+        $winUpdate = "windowsupdate.microsoft.com"
+        $result.WindowsUpdateResolved = [bool](Resolve-DnsName $winUpdate -ErrorAction SilentlyContinue)
+        $result.WindowsUpdatePortOpen = Test-NetConnection -ComputerName $winUpdate -Port 443 -WarningAction SilentlyContinue | Select-Object -ExpandProperty TcpTestSucceeded
+
+        # 6. Search available updates
+        $searcher = New-Object -ComObject Microsoft.Update.Searcher
+        $availableUpdates = $searcher.Search("IsInstalled=0 and Type='Software'").Updates
+        $result.AvailableUpdates = ($availableUpdates | Select-Object -ExpandProperty Title) -join "; "
+
+        # 7. Trigger update
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $downloader = $session.CreateUpdateDownloader()
+        $downloader.Updates = $availableUpdates
+        $downloader.Download()
+        $installer = $session.CreateUpdateInstaller()
+        $installer.Updates = $availableUpdates
+        $installResult = $installer.Install()
+        $result.TriggerStatus = $installResult.ResultCode
+
+        # 8 & 9. Track errors
+        $errorCodes = $installResult | Select-Object -ExpandProperty ResultCode
+        $result.ErrorCodes = $errorCodes
+    }
+    catch {
+        $result.ErrorCodes = $_.Exception.Message
+    }
+
+    return $result
+}
+
+# Run in parallel with throttling
+$computers | ForEach-Object -Parallel {
+    param($KB, $scriptBlock)
+
+    if (Test-Connection -ComputerName $_ -Count 2 -Quiet) {
+        $using:reachable += $_
+        $res = Invoke-Command -ComputerName $_ -ScriptBlock $using:scriptBlock -ArgumentList $KB -ErrorAction SilentlyContinue
+        $using:results += $res
+
+        if ($res.ErrorCodes -and $res.ErrorCodes -ne '0') {
+            $using:errors += $res
+        }
+    }
+    else {
+        $using:unreachable += $_
+    }
+
+} -ThrottleLimit $ThrottleLimit -ArgumentList $KB, $scriptBlock
+
+# Export CSV
+$results | Export-Csv $outputCSV -NoTypeInformation
+$errors | Export-Csv $errorCSV -NoTypeInformation
+
+# Reachability output
+$reachable | Out-File $reachableList
+$unreachable | Out-File $unreachableList
+
+# HTML Report Generation
+$html = @"
+<html><head><style>
+.success { color: green; }
+.fail { color: red; }
+</style></head><body>
+<h2>Windows Update Audit Report</h2>
+<table border='1'><tr><th>Computer</th><th>WSUS</th><th>WindowsUpdate</th><th>Ping</th><th>KB Installed</th><th>C Drive Space</th><th>SCCM Cache</th><th>Error Code</th></tr>
+"@
+
+foreach ($res in $results) {
+    $wsusStatus = if ($res.WSUSResolved -and $res.WSUSPortOpen) { "success" } else { "fail" }
+    $winStatus = if ($res.WindowsUpdateResolved -and $res.WindowsUpdatePortOpen) { "success" } else { "fail" }
+    $pingStatus = if ($reachable -contains $res.Computer) { "success" } else { "fail" }
+    $kbStatus = if ($res.KBInstalled) { "success" } else { "fail" }
+    $cDriveStatus = if ($res.CDriveGBFree -gt 10) { "success" } else { "fail" }
+    $cacheStatus = if ($res.SCCMCacheGB -lt 20) { "success" } else { "fail" }
+
+    $html += "<tr><td>$($res.Computer)</td><td class='$wsusStatus'>$wsusStatus</td><td class='$winStatus'>$winStatus</td><td class='$pingStatus'>$pingStatus</td><td class='$kbStatus'>$kbStatus</td><td class='$cDriveStatus'>$($res.CDriveGBFree) GB</td><td class='$cacheStatus'>$($res.SCCMCacheGB) GB</td><td><a href='https://learn.microsoft.com/en-us/search/?terms=$($res.ErrorCodes)'>$($res.ErrorCodes)</a></td></tr>"
+}
+
+$html += "</table></body></html>"
+$html | Out-File $htmlReport
+
+Write-Host "Audit completed. Results saved to $outputCSV and $htmlReport."
