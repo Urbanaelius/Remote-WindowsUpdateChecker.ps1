@@ -1,33 +1,47 @@
 param (
-	[Parameter(Mandatory = $true)]
-	[string]$KBID
+    [Parameter(Mandatory = $true)]
+    [string]$KBID,
+
+    [Parameter(Mandatory = $true)]
+    [string]$computerListPath
 )
-#Parameters to make -KBID as a required parameter when running the script. 
-#Eg: .\Collect_ windowsUpdateErrorLog.ps1 -KBID KB5058379
+
+# Example usage:
+# .\Collect_windowsUpdateErrorLog.ps1 -KBID KB5058379 -ComputerPath "cleaned_hostname.txt"
 
 # Paths and Setup
-$computerListPath = "Failed_devices.txt"
-#$kbFilePath = "kb_list.txt"
+#$computerListPath = "cleaned_hostname.txt"
+#$kbFilePath = "kb_list1.txt"
 $timestamp      = Get-Date -Format "yyyyMMdd_HHmm"
-$htmlReportPath = ".\results\PatchFailureReport-$timestamp.html"
-$csvReportPath = ".\results\PatchFailureAnalysis-$timestamp.csv"
-$maxThreads = 10
+$htmlReportPath = ".\PatchFailureReport-$timestamp.html"
+$csvReportPath = ".\PatchFailureAnalysis-$timestamp.csv"
+$unreachableComputer     = ".\UnreachableDevices_$timestamp.txt"
+$reachableComputer       = ".\ReachableDevices_$timestamp.txt"
+$maxThreads = 20
+
+$reachable = @()
+$unreachable = @()
 
 
-
-# Read Device List
-$computers = Get-Content $computerListPath
+# to remove "" from the path
+$cleanPath = $computerListPath.Trim('"')
+$computers = Get-Content $cleanPath
 $jobs = @()
 $results = @()
 
 # Extract Error Codes from Log Text
+
 function Get-ErrorCodesFromText {
-    param ($logText)
+    param ($logText, $fullTextMap)
     if (-not $logText) { return "" }
     $codes = Select-String -InputObject $logText -Pattern "0x[0-9A-Fa-f]{8}" -AllMatches | ForEach-Object { $_.Matches.Value }
-    return ($codes | Sort-Object -Unique) -join ", "
+    $codes = $codes | Sort-Object -Unique
+    $html = foreach ($code in $codes) {
+        $tooltip = if ($fullTextMap.ContainsKey($code)) { $fullTextMap[$code] } else { "No details available" }
+        "<a href='https://learn.microsoft.com/search/?terms=$code' title='$tooltip'>$code</a>"
+    }
+    return $html -join "<br>"
 }
-
 # Scriptblock for Remote Collection
 $scriptBlock = {
     param($comp, $kbID)
@@ -47,12 +61,13 @@ $scriptBlock = {
         WinUpdateErrors = ""
 		WindowsUpdateDNS = "N/A"
 		WindowsUpdatePort443 = "N/A"
+		AllKBInstalled = "N/A"
+		Last5KBInstalled ="N/A"
 
     }
 
-    if (Test-Connection -ComputerName $comp -Count 1 -Quiet) {
-        $data.Reachable = "Yes"
-
+    if ($comp -and $comp.Trim() -ne "" -and (Test-Connection -ComputerName $comp -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+        $data.Reachable = "Yes"		
         try {
             Invoke-Command -ComputerName $comp -ScriptBlock {
                 param($kbID)
@@ -99,18 +114,35 @@ $scriptBlock = {
 				}
 
                 $pendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
-                $kbInstalled = (Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.HotFixID -eq $kbID }).HotFixID
-
-                $logs = @{
+                $kbInstalled = (Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.HotFixID -eq $kbID }).HotFixID				
+				
+				## Collecting last 5 HotFix
+				$hotfixes = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 5
+				#$kbSummary = foreach ($hf in $hotfixes) {
+				#	$dateStr = if ($hf.InstalledOn) { $hf.InstalledOn.ToString("MM/dd/yyyy") } else { "Unknown install date" }
+				#	"$($hf.HotFixID) ($dateStr)"
+				#} -join "<br>"
+                					
+								
+				$logs = @{
                     ReportingEvents = ""
                     UpdatesDeploymentLog = ""
                     WinUpdateErrors = ""
                 }
 
                 if (-not $kbInstalled) {
-                    $logs.ReportingEvents = Get-Content "C:\Windows\SoftwareDistribution\ReportingEvents.log" -ErrorAction SilentlyContinue | Out-String
-                    $logs.UpdatesDeploymentLog = Get-Content "C:\Windows\CCM\Logs\UpdatesDeployment.log" -Tail 50 -ErrorAction SilentlyContinue | Out-String
-                    $logs.WinUpdateErrors = Get-WinEvent -FilterHashtable @{LogName='System'; ID=20,25,31,34} -MaxEvents 10 -ErrorAction SilentlyContinue | Select TimeCreated, Id, Message | Out-String
+                    #$logs.ReportingEvents = Get-Content "C:\Windows\SoftwareDistribution\ReportingEvents.log" -ErrorAction SilentlyContinue | Out-String
+					#$logs.ReportingEvents = Get-Content "C:\Windows\SoftwareDistribution\ReportingEvents.log" -Tail 50 -ErrorAction SilentlyContinue | Where-Object { $_ -match "KB\\d{7}" -and $_ -match "error|fail|0x[0-9A-Fa-f]{8}" } |ForEach-Object { $_.Trim() } |Out-String
+					$logs.ReportingEvents = Get-Content "C:\Windows\SoftwareDistribution\ReportingEvents.log" -ErrorAction SilentlyContinue |
+					Where-Object {$_ -match "KB\d{7}" -or $_ -match "0x[0-9A-Fa-f]{8}" -or $_ -match "error|fail" } |
+					ForEach-Object {($_.Trim() -split '\}\s+\d{4}-\d{2}-\d{2}.*?\d{3}\s+')[1] -replace '^\[\w+\]\s+\d+\s+\{[^\}]+\}\s+\d+\s+', '' } | Out-String
+                    #$logs.UpdatesDeploymentLog = Get-Content "C:\Windows\CCM\Logs\UpdatesDeployment.log" -Tail 50 -ErrorAction SilentlyContinue | Out-String
+					$logs.UpdatesDeploymentLog = Get-Content "C:\Windows\CCM\Logs\UpdatesDeployment.log" -Tail 50 -ErrorAction SilentlyContinue | 
+					Where-Object { $_ -match "KB\\d{7}" -or $_ -match "0x[0-9A-Fa-f]{8}" -or $_ -match "error|fail" } | ForEach-Object { $_.Trim() } |Out-String
+                    #$logs.WinUpdateErrors = Get-WinEvent -FilterHashtable @{LogName='System'; ID=20,25,31,34;StartTime=(Get-Date).AddDays(-14)} -MaxEvents 20 -ErrorAction SilentlyContinue | Select TimeCreated, Id, Message | Out-String
+					$logs.WinUpdateErrors = Get-WinEvent -FilterHashtable @{LogName = 'System'; ID = 20,25,31,34; StartTime = (Get-Date).AddDays(-15)} -MaxEvents 20 -ErrorAction SilentlyContinue |
+					Select-Object TimeCreated, Id, Message | ForEach-Object {"$($_.TimeCreated) [$($_.Id)] $($_.Message)"} |
+					Where-Object {$_ -match "KB\d{7}" -or $_ -match "0x[0-9A-Fa-f]{8}" -or $_ -match "error|fail" } | ForEach-Object { $_.Trim() } | Out-String
                 }
 
                 return [PSCustomObject]@{
@@ -125,6 +157,7 @@ $scriptBlock = {
                     WinUpdateErrors = $logs.WinUpdateErrors.Trim()
 					WindowsUpdateDNS = $winUpdateConnectivity
 					WindowsUpdatePort443 = $winUpdatePortTest
+					AllKBInstalled       = $hotfixes
 
                 }
             } -ArgumentList $kbID -ErrorAction Stop | ForEach-Object {
@@ -138,15 +171,21 @@ $scriptBlock = {
                 $data.UpdatesDeploymentLog = $_.UpdatesDeploymentLog
                 $data.WinUpdateErrors = $_.WinUpdateErrors
 				$data.WindowsUpdateDNS = $_.WindowsUpdateDNS
-				$data.WindowsUpdatePort443 = $_.WindowsUpdatePort443
+				$data.WindowsUpdatePort443 = $_.WindowsUpdatePort443				
+				$AllKBInstalled=$_.AllKBInstalled
+				$data.Last5KBInstalled = ($AllKBInstalled | Where-Object { $_.HotFixID -and $_.HotFixID.Trim() -ne "" } | ForEach-Object {
+					$dateStr = if ($_.InstalledOn) { $_.InstalledOn.ToString("MM/dd/yyyy") } else { "Unknown install date" }
+					"$($_.HotFixID) ($dateStr)"
+				}) -join "<br>"
 
             }
         } catch {
             $data.ReportingEvents = "Failed to connect or collect remote data"
         }
-    }
+    }	
     return $data
 }
+
 
 # Launch Jobs with Thread Control
 foreach ($comp in $computers) {
@@ -157,13 +196,17 @@ foreach ($comp in $computers) {
 
 # Collect Results with Real-Time Status
 
-Write-Host "⏳ Collecting Data..."
+Write-Host "... Collecting Data..."
 do {
  $completedJobs = Get-Job -State Completed
 	foreach ($job in $completedJobs) {
 		$output = Receive-Job -Job $job
-			if ($output.Reachable -eq "Yes") {Write-Host "$($output.ComputerName) is reachable" -ForegroundColor Green} 
-			else {Write-Host "$($output.ComputerName) is unreachable" -ForegroundColor Red}
+			if ($output.Reachable -eq "Yes") {		
+				$reachable += $output.ComputerName
+				Write-Host "$($output.ComputerName) is reachable" -ForegroundColor Green} 
+			else {
+				$unreachable += $output.ComputerName
+				Write-Host "$($output.ComputerName) is unreachable" -ForegroundColor Red}
 		$results += $output
 		Remove-Job -Job $job }
 } while ((Get-Job).Count -gt 0)
@@ -171,6 +214,8 @@ do {
 
 # Export CSV with Full Logs
 $results | Export-Csv -Path $csvReportPath -NoTypeInformation
+$reachable | Set-Content -Path $reachableComputer -Encoding UTF8
+$unreachable | Set-Content -Path $unreachableComputer -Encoding UTF8
 
 # Build Clean HTML Report
 
@@ -190,21 +235,36 @@ $htmlBody = foreach ($item in $results) {
     $kbInstalledHtml = if ($item.KBInstalled -eq "Yes") { '<div class="green">Yes</div>' } else { '<div class="red">No</div>' }
 	$winUpdateDNSHtml = if ($item.WindowsUpdateDNS -eq "Resolved") { '<div class="green">Resolved</div>' } else { '<div class="red">Failed</div>' }
 	$winUpdatePortHtml = if ($item.WindowsUpdatePort443 -eq "Success") { '<div class="green">Success</div>' } else { '<div class="red">Failed</div>' }
-    $reportingErrors = Get-ErrorCodesFromText $item.ReportingEvents
-    $deploymentErrors = Get-ErrorCodesFromText $item.UpdatesDeploymentLog
-    $winUpdateErrors = Get-ErrorCodesFromText $item.WinUpdateErrors
+	$freespaceGBHTML = if ($item.FreeSpace_GB -lt 20) {"<div class='red'>$($item.FreeSpace_GB)</div>"} else {"$($item.FreeSpace_GB)" }
 
-
+    $map = @{}
+    foreach ($line in ($item.ReportingEvents, $item.UpdatesDeploymentLog, $item.WinUpdateErrors, $item.WindowsUpdateLog)) {
+        if ($line) {
+            $matches = Select-String -InputObject $line -Pattern "0x[0-9A-Fa-f]{8}" -AllMatches
+            foreach ($match in $matches) {
+                foreach ($code in $match.Matches.Value) {
+                    if (-not $map.ContainsKey($code)) {
+                        $map[$code] = $line
+                    }
+                }
+            }
+        }
+    }
+    $reportingErrors = Get-ErrorCodesFromText $item.ReportingEvents $map
+    $deploymentErrors = Get-ErrorCodesFromText $item.UpdatesDeploymentLog $map
+    $winUpdateErrors = Get-ErrorCodesFromText $item.WinUpdateErrors $map
+	
     "<tr>
         <td>$($item.ComputerName)</td>
         <td>$reachableHtml</td>
         <td>$($item.KBTargeted)</td>
         <td>$kbInstalledHtml</td>
+		<td>$($item.Last5KBInstalled)</td>
         <td>$($item.WSUSServer)</td>
         <td>$($item.WSUSPingResult)</td>		
 		<td>$winUpdateDNSHtml</td>
 		<td>$winUpdatePortHtml</td>
-        <td>$($item.FreeSpace_GB)</td>
+        <td>$freespaceGBHTML</td>
         <td>$($item.SCCMCache_GB)</td>
         <td>$($item.PendingReboot)</td>
         <td>$reportingErrors</td>
@@ -226,6 +286,7 @@ $htmlHeader
         <th>Reachable</th>
         <th>KBTargeted</th>
         <th>KBInstalled</th>
+		<th>Last5KBInstalled</th>
         <th>WSUSServer</th>
         <th>WSUSPingResult</th>		
 		<th>WinUpdate DNS</th>
@@ -243,11 +304,17 @@ $htmlHeader
 </html>
 "@
 
+
 $htmlTable | Out-File $htmlReportPath -Encoding UTF8
 
 
-Write-Host "`n✅ Reports generated:"
+Write-Host "`nReports generated:"
 Write-Host " - CSV: $csvReportPath"
 Write-Host " - HTML: $htmlReportPath"
-
+Write-Host " - Reachable: $reachableComputer"
+Write-Host " - Unreachable: $unreachableComputer"
+Write-Host "`nTotal Reachable Devices: $($reachable.Count)"
+Write-Host "Total Unreachable Devices: $($unreachable.Count)"
 Start-Process $htmlReportPath
+
+Read-Host "Press Enter to exit"
